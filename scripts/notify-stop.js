@@ -100,6 +100,7 @@ function getProjectName() {
 function getGitBranch() {
   try {
     const cwd = process.env.CLAUDE_PROJECT_DIR || process.cwd();
+    if (!fs.existsSync(cwd)) return null;
     return execSync('git rev-parse --abbrev-ref HEAD', {
       cwd, encoding: 'utf-8', timeout: 3000,
       stdio: ['pipe', 'pipe', 'pipe'],  // P1-10: suppress stderr
@@ -138,12 +139,13 @@ function getLastPrompt(input, config) {
     const stat = fs.statSync(transcript);
     const readSize = Math.min(stat.size, 524288);
     const start = Math.max(0, stat.size - readSize);
+    let content;
     let fd;
     try {
       fd = fs.openSync(transcript, 'r');
       const buf = Buffer.alloc(readSize);
       fs.readSync(fd, buf, 0, buf.length, start);
-      var content = buf.toString('utf-8');
+      content = buf.toString('utf-8');
     } finally {
       if (fd !== undefined) fs.closeSync(fd);
     }
@@ -209,17 +211,16 @@ function formatDuration(ms) {
 function checkCooldown(cooldownSeconds) {
   if (!cooldownSeconds || cooldownSeconds <= 0) return true;
   const cooldownFile = path.join(os.tmpdir(), '.claude-slack-notify-last');
+  const now = Date.now();
   try {
-    if (fs.existsSync(cooldownFile)) {
-      const lastTime = parseInt(fs.readFileSync(cooldownFile, 'utf-8'), 10);
-      if (Date.now() - lastTime < cooldownSeconds * 1000) {
-        debug(`Cooldown active (${cooldownSeconds}s), skipping`);
-        return false;
-      }
+    const stat = fs.statSync(cooldownFile);
+    if (now - stat.mtimeMs < cooldownSeconds * 1000) {
+      debug(`Cooldown active (${cooldownSeconds}s), skipping`);
+      return false;
     }
-  } catch { /* ignore */ }
+  } catch { /* file doesn't exist or unreadable, proceed */ }
   try {
-    fs.writeFileSync(cooldownFile, String(Date.now()));
+    fs.writeFileSync(cooldownFile, String(now));
   } catch { /* ignore */ }
   return true;
 }
@@ -236,6 +237,10 @@ function validateWebhookUrl(webhookUrl) {
   } catch { return false; }
 }
 
+function escapeMrkdwn(text) {
+  return String(text).replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+}
+
 // P2-12: Message formatting separated
 // P3-16: Slack Block Kit
 function formatSlackBlocks(mention, project, branch, time, duration, prompt, locale) {
@@ -249,8 +254,8 @@ function formatSlackBlocks(mention, project, branch, time, duration, prompt, loc
   });
 
   // Project info
-  let infoText = `📁 *${project}*`;
-  if (branch) infoText += ` \`${branch}\``;
+  let infoText = `📁 *${escapeMrkdwn(project)}*`;
+  if (branch) infoText += ` \`${escapeMrkdwn(branch)}\``;
   infoText += `\n🕐 ${time}`;
   if (duration) infoText += `  ⏱ ${duration}`;
 
@@ -263,7 +268,7 @@ function formatSlackBlocks(mention, project, branch, time, duration, prompt, loc
   if (prompt) {
     blocks.push({
       type: 'section',
-      text: { type: 'mrkdwn', text: `💬 ${prompt}` },
+      text: { type: 'mrkdwn', text: `💬 ${escapeMrkdwn(prompt)}` },
     });
   }
 
@@ -292,7 +297,7 @@ function sendSlack(webhookUrl, payload) {
       res.on('end', () => {
         // P1-6: HTTP status code validation
         if (res.statusCode !== 200) {
-          debug(`Slack API error: ${res.statusCode} ${data}`);
+          debug(`Slack API error: ${res.statusCode}`);
           return reject(new Error(`Slack API returned ${res.statusCode}`));
         }
         resolve(data);
