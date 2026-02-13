@@ -1,45 +1,22 @@
-const { describe, it } = require('node:test');
+const { describe, it, beforeEach, after } = require('node:test');
 const assert = require('node:assert');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
 
-// Load script source for function extraction
-const scriptPath = path.join(__dirname, '..', 'scripts', 'notify-stop.js');
-const scriptSource = fs.readFileSync(scriptPath, 'utf-8');
-
-// Extract and evaluate individual functions for unit testing
-function extractFunction(source, name) {
-  // Create a module-like context with required modules
-  const module = { exports: {} };
-  const context = {
-    require: require,
-    module,
-    exports: module.exports,
-    __dirname: path.join(__dirname, '..', 'scripts'),
-    __filename: scriptPath,
-    process: { ...process, env: { ...process.env }, stdin: { isTTY: true } },
-  };
-
-  // We'll test functions by importing them indirectly
-  return null;
-}
+const {
+  formatDuration,
+  maskSecrets,
+  validateWebhookUrl,
+  checkCooldown,
+  escapeMrkdwn,
+  formatSlackBlocks,
+  MESSAGES,
+} = require('../scripts/notify-stop');
 
 // --- Unit Tests ---
 
 describe('formatDuration', () => {
-  // Recreate the function for isolated testing
-  function formatDuration(ms) {
-    const sec = Math.floor(ms / 1000);
-    if (sec < 60) return `${sec}초`;
-    const min = Math.floor(sec / 60);
-    const remainSec = sec % 60;
-    if (min < 60) return `${min}분 ${remainSec}초`;
-    const hr = Math.floor(min / 60);
-    const remainMin = min % 60;
-    return `${hr}시간 ${remainMin}분`;
-  }
-
   it('should format seconds', () => {
     assert.strictEqual(formatDuration(5000), '5초');
     assert.strictEqual(formatDuration(59000), '59초');
@@ -61,17 +38,19 @@ describe('formatDuration', () => {
   });
 });
 
-describe('maskSecrets', () => {
-  function maskSecrets(text, patterns) {
-    let masked = text;
-    for (const pat of patterns) {
-      try {
-        masked = masked.replace(new RegExp(pat, 'gi'), '***');
-      } catch { /* skip */ }
-    }
-    return masked;
-  }
+describe('formatDuration edge cases', () => {
+  it('should handle negative input', () => {
+    const result = formatDuration(-1000);
+    assert.ok(typeof result === 'string');
+  });
 
+  it('should handle very large input', () => {
+    const result = formatDuration(360000000); // 100 hours
+    assert.ok(result.includes('시간'));
+  });
+});
+
+describe('maskSecrets', () => {
   const defaultPatterns = [
     'sk-[a-zA-Z0-9]{20,}',
     'token[=:\\s]["\']?[a-zA-Z0-9_\\-]{20,}',
@@ -103,17 +82,17 @@ describe('maskSecrets', () => {
   });
 });
 
-describe('validateWebhookUrl', () => {
-  function validateWebhookUrl(webhookUrl) {
-    try {
-      const url = new URL(webhookUrl);
-      if (url.protocol !== 'https:') return false;
-      if (!url.hostname.endsWith('.slack.com')) return false;
-      if (!url.pathname.startsWith('/services/')) return false;
-      return true;
-    } catch { return false; }
-  }
+describe('maskSecrets edge cases', () => {
+  it('should handle empty text', () => {
+    assert.strictEqual(maskSecrets('', ['sk-[a-zA-Z0-9]{20,}']), '');
+  });
 
+  it('should handle empty patterns array', () => {
+    assert.strictEqual(maskSecrets('sk-abcdefghijklmnopqrstuv', []), 'sk-abcdefghijklmnopqrstuv');
+  });
+});
+
+describe('validateWebhookUrl', () => {
   it('should accept valid Slack webhook URLs', () => {
     assert.strictEqual(validateWebhookUrl('https://hooks.slack.com/services/T123/B456/abc'), true);
   });
@@ -133,6 +112,16 @@ describe('validateWebhookUrl', () => {
   it('should reject invalid URLs', () => {
     assert.strictEqual(validateWebhookUrl('not-a-url'), false);
     assert.strictEqual(validateWebhookUrl(''), false);
+  });
+});
+
+describe('validateWebhookUrl edge cases', () => {
+  it('should handle null input', () => {
+    assert.strictEqual(validateWebhookUrl(null), false);
+  });
+
+  it('should handle undefined input', () => {
+    assert.strictEqual(validateWebhookUrl(undefined), false);
   });
 });
 
@@ -174,36 +163,88 @@ describe('.env parsing regex', () => {
   });
 });
 
-describe('cooldown check', () => {
-  const cooldownFile = path.join(os.tmpdir(), '.claude-slack-notify-test-cooldown');
+describe('escapeMrkdwn', () => {
+  it('should escape ampersand', () => {
+    assert.strictEqual(escapeMrkdwn('a & b'), 'a &amp; b');
+  });
 
-  function checkCooldown(cooldownSeconds) {
-    if (!cooldownSeconds || cooldownSeconds <= 0) return true;
-    try {
-      if (fs.existsSync(cooldownFile)) {
-        const lastTime = parseInt(fs.readFileSync(cooldownFile, 'utf-8'), 10);
-        if (Date.now() - lastTime < cooldownSeconds * 1000) return false;
-      }
-    } catch { /* ignore */ }
-    try { fs.writeFileSync(cooldownFile, String(Date.now())); } catch { /* ignore */ }
-    return true;
-  }
+  it('should escape angle brackets', () => {
+    assert.strictEqual(escapeMrkdwn('<script>'), '&lt;script&gt;');
+  });
+
+  it('should handle empty string', () => {
+    assert.strictEqual(escapeMrkdwn(''), '');
+  });
+
+  it('should handle string without special chars', () => {
+    assert.strictEqual(escapeMrkdwn('hello world'), 'hello world');
+  });
+
+  it('should escape all special chars in combination', () => {
+    assert.strictEqual(escapeMrkdwn('a & b < c > d'), 'a &amp; b &lt; c &gt; d');
+  });
+});
+
+describe('formatSlackBlocks', () => {
+  it('should create header with title', () => {
+    const result = formatSlackBlocks('', 'my-project', 'main', '14:00:00', '1분 30초', 'test prompt', 'ko');
+    assert.strictEqual(result.blocks[0].type, 'header');
+    assert.ok(result.blocks[0].text.text.includes('Claude Code 응답 완료'));
+  });
+
+  it('should include project info section', () => {
+    const result = formatSlackBlocks('', 'my-project', 'main', '14:00:00', null, null, 'ko');
+    assert.ok(result.blocks[1].text.text.includes('my-project'));
+  });
+
+  it('should include branch when provided', () => {
+    const result = formatSlackBlocks('', 'proj', 'feature/test', '14:00', null, null, 'en');
+    assert.ok(result.blocks[1].text.text.includes('feature/test'));
+  });
+
+  it('should include prompt section when prompt provided', () => {
+    const result = formatSlackBlocks('', 'proj', null, '14:00', null, 'hello', 'ko');
+    assert.strictEqual(result.blocks.length, 3);
+    assert.ok(result.blocks[2].text.text.includes('hello'));
+  });
+
+  it('should omit prompt section when no prompt', () => {
+    const result = formatSlackBlocks('', 'proj', null, '14:00', null, null, 'ko');
+    assert.strictEqual(result.blocks.length, 2);
+  });
+
+  it('should include mention in text field', () => {
+    const result = formatSlackBlocks('<@U123> ', 'proj', null, '14:00', null, null, 'ko');
+    assert.ok(result.text.includes('<@U123>'));
+  });
+
+  it('should fallback to ko for unknown locale', () => {
+    const result = formatSlackBlocks('', 'proj', null, '14:00', null, null, 'xx');
+    assert.ok(result.blocks[0].text.text.includes('Claude Code 응답 완료'));
+  });
+
+  it('should escape special mrkdwn chars in project name', () => {
+    const result = formatSlackBlocks('', 'proj<test>', 'main', '14:00', null, null, 'ko');
+    assert.ok(result.blocks[1].text.text.includes('&lt;test&gt;'));
+  });
+});
+
+describe('cooldown check (imported)', () => {
+  const cooldownFile = path.join(os.tmpdir(), '.claude-slack-notify-last');
+
+  beforeEach(() => { try { fs.unlinkSync(cooldownFile); } catch {} });
+  after(() => { try { fs.unlinkSync(cooldownFile); } catch {} });
 
   it('should allow when cooldown is 0', () => {
     assert.strictEqual(checkCooldown(0), true);
   });
 
   it('should allow first call', () => {
-    try { fs.unlinkSync(cooldownFile); } catch {}
     assert.strictEqual(checkCooldown(60), true);
   });
 
   it('should block within cooldown period', () => {
+    checkCooldown(60); // first call writes the cooldown file
     assert.strictEqual(checkCooldown(60), false);
-  });
-
-  // Cleanup
-  it('cleanup', () => {
-    try { fs.unlinkSync(cooldownFile); } catch {}
   });
 });
